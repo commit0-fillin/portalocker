@@ -69,6 +69,66 @@ class RedisLock(utils.LockBase):
         for key, value in self.DEFAULT_REDIS_KWARGS.items():
             self.redis_kwargs.setdefault(key, value)
         super().__init__(timeout=timeout, check_interval=check_interval, fail_when_locked=fail_when_locked)
+        if self.connection is None:
+            self.connection = client.Redis(**self.redis_kwargs)
+        self.pubsub = self.connection.pubsub()
 
     def __del__(self):
         self.release()
+
+    def release(self):
+        if self.thread is not None:
+            self.thread.stop()
+            self.thread = None
+        if self.pubsub is not None:
+            self.pubsub.unsubscribe(self.channel)
+            self.pubsub = None
+        if self.connection is not None:
+            self.connection.publish(self.channel, json.dumps({'action': 'release'}))
+            if self.close_connection:
+                self.connection.close()
+                self.connection = None
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+    def acquire(self, timeout: typing.Optional[float] = None, check_interval: typing.Optional[float] = None, fail_when_locked: typing.Optional[bool] = None) -> 'RedisLock':
+        if timeout is None:
+            timeout = self.timeout
+        if check_interval is None:
+            check_interval = self.check_interval
+        if fail_when_locked is None:
+            fail_when_locked = self.fail_when_locked
+
+        start_time = time.time()
+        while True:
+            if self._try_acquire():
+                return self
+            if fail_when_locked:
+                raise exceptions.LockException("Failed to acquire lock")
+            if timeout is not None and time.time() - start_time > timeout:
+                raise exceptions.LockException("Timeout while acquiring lock")
+            time.sleep(check_interval)
+
+    def _try_acquire(self) -> bool:
+        if self.pubsub is None:
+            self.pubsub = self.connection.pubsub()
+        self.pubsub.subscribe(self.channel)
+        try:
+            message = self.pubsub.get_message(timeout=self.unavailable_timeout)
+            if message is None or message['type'] == 'subscribe':
+                if self.connection.publish(self.channel, json.dumps({'action': 'acquire'})) == 1:
+                    self._start_keep_alive_thread()
+                    return True
+        finally:
+            self.pubsub.unsubscribe(self.channel)
+        return False
+
+    def _start_keep_alive_thread(self):
+        if self.thread is None:
+            self.thread = PubSubWorkerThread(self.pubsub)
+            self.thread.daemon = True
+            self.thread.start()
