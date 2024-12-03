@@ -40,7 +40,10 @@ def coalesce(*args: typing.Any, test_value: typing.Any=None) -> typing.Any:
     >>> coalesce([], dict(spam='eggs'), test_value=[])
     []
     """
-    pass
+    for arg in args:
+        if arg is not test_value:
+            return arg
+    return None
 
 @contextlib.contextmanager
 def open_atomic(filename: Filename, binary: bool=True) -> typing.Iterator[typing.IO]:
@@ -68,7 +71,18 @@ def open_atomic(filename: Filename, binary: bool=True) -> typing.Iterator[typing
     >>> assert path_filename.exists()
     >>> path_filename.unlink()
     """
-    pass
+    path = pathlib.Path(filename)
+    temp_filename = f"{path}.tmp.{os.getpid()}"
+    mode = 'wb' if binary else 'w'
+    try:
+        with open(temp_filename, mode) as file:
+            yield file
+        os.rename(temp_filename, path)
+    finally:
+        try:
+            os.unlink(temp_filename)
+        except OSError:
+            pass
 
 class LockBase(abc.ABC):
     timeout: float
@@ -133,25 +147,53 @@ class Lock(LockBase):
 
     def acquire(self, timeout: typing.Optional[float]=None, check_interval: typing.Optional[float]=None, fail_when_locked: typing.Optional[bool]=None) -> typing.IO[typing.AnyStr]:
         """Acquire the locked filehandle"""
-        pass
+        if timeout is None:
+            timeout = self.timeout
+        if check_interval is None:
+            check_interval = self.check_interval
+        if fail_when_locked is None:
+            fail_when_locked = self.fail_when_locked
+
+        start_time = time.time()
+        while True:
+            try:
+                fh = self._get_fh()
+                fh = self._get_lock(fh)
+                fh = self._prepare_fh(fh)
+                self.fh = fh
+                return fh
+            except exceptions.LockException as exception:
+                if fail_when_locked:
+                    raise
+                if timeout is not None and time.time() - start_time > timeout:
+                    raise exceptions.LockException(exception)
+                time.sleep(check_interval)
 
     def __enter__(self) -> typing.IO[typing.AnyStr]:
         return self.acquire()
 
     def release(self):
         """Releases the currently locked file handle"""
-        pass
+        if self.fh:
+            portalocker.unlock(self.fh)
+            self.fh.close()
+            self.fh = None
 
     def _get_fh(self) -> typing.IO:
         """Get a new filehandle"""
-        pass
+        return open(self.filename, self.mode, **self.file_open_kwargs)
 
     def _get_lock(self, fh: typing.IO) -> typing.IO:
         """
         Try to lock the given filehandle
 
         returns LockException if it fails"""
-        pass
+        try:
+            portalocker.lock(fh, self.flags)
+        except exceptions.BaseLockException as exception:
+            fh.close()
+            raise exceptions.LockException(exception)
+        return fh
 
     def _prepare_fh(self, fh: typing.IO) -> typing.IO:
         """
@@ -160,7 +202,10 @@ class Lock(LockBase):
         If truncate is a number, the file will be truncated to that amount of
         bytes
         """
-        pass
+        if self.truncate:
+            fh.seek(0)
+            fh.truncate(0)
+        return fh
 
 class RLock(Lock):
     """
@@ -233,5 +278,5 @@ class NamedBoundedSemaphore(BoundedSemaphore):
 
     def __init__(self, maximum: int, name: typing.Optional[str]=None, filename_pattern: str='{name}.{number:02d}.lock', directory: str=tempfile.gettempdir(), timeout: typing.Optional[float]=DEFAULT_TIMEOUT, check_interval: typing.Optional[float]=DEFAULT_CHECK_INTERVAL, fail_when_locked: typing.Optional[bool]=True):
         if name is None:
-            name = 'bounded_semaphore.%d' % random.randint(0, 1000000)
+            name = f'bounded_semaphore.{random.randint(0, 1000000)}'
         super().__init__(maximum, name, filename_pattern, directory, timeout, check_interval, fail_when_locked)
