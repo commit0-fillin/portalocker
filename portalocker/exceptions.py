@@ -5,7 +5,7 @@ class BaseLockException(Exception):
 
     def __init__(self, *args: typing.Any, fh: typing.Union[typing.IO, None, int]=None, **kwargs: typing.Any) -> None:
         self.fh = fh
-        Exception.__init__(self, *args)
+        super().__init__(*args, **kwargs)
 
 class LockException(BaseLockException):
     pass
